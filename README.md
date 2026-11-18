@@ -1,115 +1,100 @@
 # bt77-acme-fix
 
-Audit and repair script for **BT-Panel (Baota) 7.7.0** — the build many people keep because later
-versions push account binding and forced upgrades.
+给 **宝塔面板 7.7.0** 用的安装后体检与修复脚本。
 
-A stock 7.7.0 install has a certificate-renewal defect that only shows up months later:
-**Let's Encrypt renewals succeed, the new certificate is downloaded, and nginx keeps serving the
-expired one.** This script finds that state, patches the two code paths responsible, restores the
-missing deployment step, and reports the other traps of a fresh install.
+7.7.0 有个证书续期的坑，要等好几个月才暴露：**Let's Encrypt 续签是成功的、新证书也下载下来了，但 nginx 一直在发那张过期证书**。面板日志写着"续签成功"，只有手动去点一次才对。这个脚本能把这种状态查出来，把两处导致问题的代码打上补丁，把漏掉的部署补回去，顺便把新装机器的其他坑一起报出来。
 
 ```
-check    read-only report, safe on production
-fix      patch acme_v2.py, ensure the renewal cron, re-deploy drifted certificates
-harden   opt-in: panel port, IP whitelist, BasicAuth, phpMyAdmin
+check    只读体检，生产环境可以直接跑
+fix      打补丁 + 补续签任务 + 把漂移的证书重新部署
+harden   可选加固：面板端口、IP 白名单、BasicAuth、phpMyAdmin
 ```
 
-## The problem
+> English version: [README.en.md](README.en.md)
 
-`class/acme_v2.py` deploys a renewed certificate by comparing it with the one currently used by the
-site. The comparison includes the issuer **CN**:
+## 问题是什么
+
+`class/acme_v2.py` 在把新证书覆盖到站点目录前，会先判断"这张新证书和站点现在用的那张是不是同一家 CA 签的"，判断依据是签发者的 **CN**：
 
 ```python
 if to_cert_init['issuer'] != cert_init['issuer'] and to_cert_init['issuer'].find("Let's Encrypt") == -1:
-    continue    # silently skip, not even a log line
+    continue    # 静默跳过，一行日志都不写
 ```
 
-Let's Encrypt rotates its intermediate CA (today `R10/R11/E5` become `YR1/YR2/...`). The comparison
-sees `R11` vs `YR2`, neither contains the literal string `Let's Encrypt`, concludes "different CA",
-and skips the copy. ACME still reports success, so the panel log says `续签成功` while the site keeps
-an expired certificate until it is applied by hand.
+Let's Encrypt 会轮换中间证书（现在是 `R10/R11/E5`，之后是 `YR1/YR2/...`）。代码拿到 `R11` 和 `YR2`，两个字符串里都不含 `Let's Encrypt`（那是在 `O=` 字段里，代码没读），于是判定"品牌不一致"→ 跳过部署。ACME 那边一切正常，所以面板显示续签成功，站点证书却停在旧的那张。
 
-See [docs/ISSUES.md](docs/ISSUES.md) for the full list with source references.
+完整清单（带源码行号）见 [docs/ISSUES.md](docs/ISSUES.md)。
 
-## Quick start
+## 快速开始
 
 ```bash
-# 1. look before touching anything
+# 1. 先看，不动任何东西
 curl -fsSLO https://raw.githubusercontent.com/lengqie/bt77-acme-fix/main/bt77-acme-fix.sh
 bash bt77-acme-fix.sh check
 
-# 2. patch the renewal path (backs everything up, idempotent, asks for confirmation)
+# 2. 修续期链路（会先备份、幂等、执行前二次确认）
 bash bt77-acme-fix.sh fix
 
-# 3. optional hardening, pick what you need
+# 3. 可选加固，按需挑
 bash bt77-acme-fix.sh harden --panel-port 28488 --allow-ip 203.0.113.7
 ```
 
-Requirements: root, BT-Panel 7.7.0 at `/www/server/panel`, `bash` 4+, `openssl`, `python3`.
+要求：root 权限、面板装在 `/www/server/panel`、`bash` 4+、`openssl`、`python3`。
 
-## What `check` reports
+## `check` 会报什么
 
-| Section | Checks |
+| 分区 | 检查内容 |
 |---|---|
-| certificate renewal | is `acme_v2.py` patched, does the daily renewal cron exist, does the panel python have a working `OpenSSL.crypto.PKCS12` |
-| certificate orders | every order's domains, days left, domains with no A record (they can never validate over http-01), incomplete orders the renewer skips |
-| deployment drift | for each downloaded certificate: is the copy served from `vhost/cert` actually the same one |
-| panel exposure | panel port, random admin path, IP whitelist, BasicAuth, ufw rules for the panel port / 888 / passive FTP, phpMyAdmin presence, panel HTTPS |
+| 证书续期 | `acme_v2.py` 是否已打补丁、每日续签任务是否存在、面板的 python 里 `OpenSSL.crypto.PKCS12` 是否可用 |
+| 证书订单 | 每条订单的域名、剩余天数、**没有 A 记录**的域名（http-01 永远验不过）、续期器会静默跳过的残缺订单 |
+| 部署漂移 | 每个已下载的证书：`vhost/cert` 里实际提供给 nginx 的那张，和它是不是同一张 |
+| 面板暴露面 | 面板端口、随机安全入口、IP 白名单、BasicAuth、ufw 里面板端口/888/被动 FTP 的放行、phpMyAdmin 是否存在、面板 HTTPS 是否开启 |
 
-Exit code is `0` even when it finds problems: it is a report, not a gate.
+`check` 是纯只读的，发现问题也返回 0（它是报告，不是门禁）。
 
-## What `fix` changes
+## `fix` 具体改什么
 
 1. `class/acme_v2.py`
-   - adds `_bt77_le_ca()` and uses it in the issuer comparison, so any Let's Encrypt style
-     intermediate CN (`R11`, `YR2`, ...) counts as the same CA family;
-   - wraps the optional pkcs12/IIS export in `try/except`: on hosts where `OpenSSL.crypto.PKCS12`
-     is missing, that export used to abort `save_cert()` **before** the site deployment;
-   - both edits are marked `# [bt77-fix]` and skipped if already applied.
-2. Renewal cron: the panel only creates it after you open the SSL page once, so a fresh install can
-   have no renewal job at all. Adds `10 0 * * *` running `acme_v2.py --renew=1` if missing.
-3. Deployment sync (`--no-sync` to skip): re-runs the panel's own `sub_all_cert()` for every
-   certificate in `vhost/letsencrypt`, which repairs sites that are already stuck on an old copy.
-4. Restarts the panel so the long-running web process picks up the patch.
+   - 增加 `_bt77_le_ca()`，用在签发者比对里：任何 Let's Encrypt 风格的中间证书 CN（`R11`、`YR2`……）都算同一家 CA；
+   - 把可选的 pkcs12/IIS 导出包进 `try/except`：在 `OpenSSL.crypto.PKCS12` 缺失的机器上，这一步原来会**在部署之前**就抛异常，导致证书根本不落地；
+   - 两处改动都带 `# [bt77-fix]` 标记，重复执行会跳过。
+2. 续签任务：面板只在第一次使用 SSL 功能时才创建，所以新机器可能压根没有续期任务。缺失时补一条 `10 0 * * *` 执行 `acme_v2.py --renew=1`。
+3. 部署同步（`--no-sync` 可跳过）：对 `vhost/letsencrypt` 里每个证书重跑面板自己的 `sub_all_cert()`，把已经卡在旧证书上的站点直接修好。
+4. 重启面板，让常驻的 web 进程加载补丁。
 
-Backups land in `/root/bt77-acme-fix-<timestamp>/` (`acme_v2.py`, `crontab.bak`).
-Rollback:
+备份在 `/root/bt77-acme-fix-<时间戳>/`（`acme_v2.py`、`crontab.bak`）。回滚：
 
 ```bash
 cp /root/bt77-acme-fix-*/acme_v2.py /www/server/panel/class/acme_v2.py
 /etc/init.d/bt restart
 ```
 
-## Hardening flags (all opt-in, each prints its own rollback)
+## `harden` 参数（全部可选，每个都会打印自己的回滚办法）
 
-| Flag | Effect |
+| 参数 | 作用 |
 |---|---|
-| `--panel-port N` | writes `data/port.pl`, restarts the panel; reminds you to open N and close the old port in the cloud firewall |
-| `--allow-ip "IP[,IP,-IP]"` | writes `data/limitip.conf` (comma separated, ranges with `-`), panel only answers whitelisted sources |
-| `--basic-auth USER:PASS` | writes `config/basic_auth.json` in the panel's own `md5(value + "_bt.cn")` format |
-| `--close-pma` | moves `/www/server/phpmyadmin` into the backup directory and drops the `888/tcp` ufw rule |
-| `--yes` | skip the interactive confirmation |
+| `--panel-port N` | 写 `data/port.pl` 并重启面板；提醒你去云防火墙放行 N、关掉旧端口 |
+| `--allow-ip "IP[,IP,-IP]"` | 写 `data/limitip.conf`（逗号分隔，区间用 `-`），面板只对白名单来源应答 |
+| `--basic-auth USER:PASS` | 按面板自己的 `md5(值 + "_bt.cn")` 规则写 `config/basic_auth.json` |
+| `--close-pma` | 把 `/www/server/phpmyadmin` 移到备份目录，并删掉 ufw 的 `888/tcp` 放行 |
+| `--yes` | 跳过交互确认 |
 
-## Notes and limits
+## 说明与限制
 
-- The script does not modify certificates, site configs or firewall beyond the flags above.
-- It never phones home; everything runs locally.
-- 7.7.0 is a 2021 build with known unfixed issues. This script removes two specific renewal bugs and
-  reduces exposure; it does not make the panel current. If you can upgrade, upgrade.
-- Tested against the source archive in [8838/btpanel-v7.7.0](https://github.com/8838/btpanel-v7.7.0)
-  (`install/src/LinuxPanel-7.7.0.zip`) and on two live 7.7.0 hosts (Debian 12). Other builds may
-  have backported code: `fix` refuses to patch if it cannot find the exact stock anchors, and
-  `check` will still tell you whether certificates are drifting.
+- 脚本不碰证书内容、不改站点配置；除了上面列出的参数，也不动防火墙。
+- 全程本地执行，不连任何外部接口。
+- 7.7.0 是 2021 年的版本，有一批永远不会修的已知问题。这个脚本只修两条具体的续期 bug 并降低暴露面，**不等于把面板变成安全版本**；能升级就升级。
+- 比对基准是 [8838/btpanel-v7.7.0](https://github.com/8838/btpanel-v7.7.0) 里的 `install/src/LinuxPanel-7.7.0.zip`，另外在两台线上 7.7.0（Debian 12）验证过。其他发行版可能已经回填过代码：找不到原始锚点时 `fix` 会拒绝打补丁，`check` 依然能告诉你证书是否在漂移。
 
-## Development
+## 开发
 
 ```bash
-bash -n bt77-acme-fix.sh          # syntax
+bash -n bt77-acme-fix.sh          # 语法检查
 shellcheck -S error bt77-acme-fix.sh
-# run against an extracted panel tree without root:
+# 不 root 的情况下对着一份解包的面板源码跑：
 BT77_ALLOW_NON_ROOT=1 PANEL_DIR=/tmp/panel PANEL_PY=python3 bash bt77-acme-fix.sh check
 ```
 
-## License
+## 许可
 
 MIT
