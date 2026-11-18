@@ -21,7 +21,7 @@
 #
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PANEL_DIR="${PANEL_DIR:-/www/server/panel}"
 PANEL_PY="${PANEL_PY:-$PANEL_DIR/pyenv/bin/python}"
 ACME="$PANEL_DIR/class/acme_v2.py"
@@ -45,7 +45,50 @@ fail() { printf '%s[FAIL]%s %s\n' "$C_R" "$C_0" "$*"; }
 die()  { fail "$*"; exit 1; }
 
 usage() {
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'EOF'
+bt77-acme-fix.sh <子命令> [选项]
+
+宝塔面板 7.7.0 安装后体检与修复。
+
+子命令
+  check                只读体检，不改任何东西
+  fix                  打补丁 + 补续签任务 + 重新部署漂移证书 + 重启面板
+  harden              加固，至少给一个选项（见下）
+
+fix 的选项
+  --no-sync            跳过“把已漂移的证书重新部署”这一步
+  --yes, -y            跳过交互确认
+
+harden 的选项（可组合，每个动作都会打印自己的回滚命令）
+  --panel-port N       把面板端口改成 N（写 data/port.pl 并重启面板）
+                       改完必须去云安全组/防火墙放行 N、关掉旧端口
+  --allow-ip LIST      面板只对白名单来源应答，写 data/limitip.conf
+                       LIST 逗号分隔，支持区间，例如：
+                         --allow-ip "1.2.3.4,5.6.7.8,10.0.0.1-10.0.0.9"
+                       注意：README 里的 203.0.113.7 是文档保留地址，必须换成你自己的 IP
+                       家庭宽带/动态 IP 不建议用此项，IP 一变就把自己关在门外
+  --basic-auth U:P     开启面板 BasicAuth（面板自己的 md5(值+"_bt.cn") 规则）
+  --close-pma          把 phpMyAdmin 目录移到备份目录，并关闭 ufw 的 888/tcp
+  --yes, -y            跳过交互确认
+
+示例
+  bash bt77-acme-fix.sh check
+  bash bt77-acme-fix.sh fix
+  bash bt77-acme-fix.sh harden --panel-port 28488
+  bash bt77-acme-fix.sh harden --allow-ip "1.2.3.4,10.0.0.1-10.0.0.254" --basic-auth admin:密码
+  bash bt77-acme-fix.sh harden --close-pma --yes
+
+把自己锁在门外时
+  rm -f /www/server/panel/data/limitip.conf      # 撤销 IP 白名单
+  echo 8888 > /www/server/panel/data/port.pl     # 端口改回去
+  /etc/init.d/bt restart
+
+环境变量（调试用）
+  PANEL_DIR   面板目录，默认 /www/server/panel
+  PANEL_PY    面板 python，默认 $PANEL_DIR/pyenv/bin/python
+  BACKUP_DIR  备份目录，默认 /root/bt77-acme-fix-<时间戳>
+  BT77_ALLOW_NON_ROOT=1   允许非 root 运行（仅测试用）
+EOF
     exit 0
 }
 
@@ -496,7 +539,7 @@ cmd_harden() {
             --basic-auth) shift; harden_basic_auth "${1:-}"; act=1 ;;
             --close-pma)  harden_close_pma; act=1 ;;
             --yes|-y)     ;;
-            *) die "unknown option: $1" ;;
+            *) die "unknown option: $1 (bash $0 --help for usage)" ;;
         esac
         shift
     done

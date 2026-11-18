@@ -35,11 +35,17 @@ bash bt77-acme-fix.sh check
 # 2. 修续期链路（会先备份、幂等、执行前二次确认）
 bash bt77-acme-fix.sh fix
 
-# 3. 可选加固，按需挑
-bash bt77-acme-fix.sh harden --panel-port 28488 --allow-ip 203.0.113.7
+# 3. 可选加固，按需挑（每个参数的详细说明见 --help）
+bash bt77-acme-fix.sh harden --panel-port 28488 --allow-ip "<你自己的公网IP>"
+
+# 完整用法
+bash bt77-acme-fix.sh --help
 ```
 
 要求：root 权限、面板装在 `/www/server/panel`、`bash` 4+、`openssl`、`python3`。
+
+> `--allow-ip` 用错会把自己关在门外（IP 写错或变成动态 IP）。救援：SSH 登录后 `rm -f /www/server/panel/data/limitip.conf && /etc/init.d/bt restart`。
+> 家庭宽带/动态 IP 建议改用 `--basic-auth 用户名:密码`。
 
 ## `check` 会报什么
 
@@ -74,7 +80,7 @@ cp /root/bt77-acme-fix-*/acme_v2.py /www/server/panel/class/acme_v2.py
 | 参数 | 作用 |
 |---|---|
 | `--panel-port N` | 写 `data/port.pl` 并重启面板；提醒你去云防火墙放行 N、关掉旧端口 |
-| `--allow-ip "IP[,IP,-IP]"` | 写 `data/limitip.conf`（逗号分隔，区间用 `-`），面板只对白名单来源应答 |
+| `--allow-ip "IP[,IP,-IP]"` | 写 `data/limitip.conf`（逗号分隔，区间用 `-`，不支持 CIDR），面板只对白名单来源应答 |
 | `--basic-auth USER:PASS` | 按面板自己的 `md5(值 + "_bt.cn")` 规则写 `config/basic_auth.json` |
 | `--close-pma` | 把 `/www/server/phpmyadmin` 移到备份目录，并删掉 ufw 的 `888/tcp` 放行 |
 | `--yes` | 跳过交互确认 |
